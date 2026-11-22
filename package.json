@@ -1,0 +1,10 @@
+{
+  "name":"telegram-archive-bot",
+  "version":"1.0.0",
+  "private":true,
+  "description":"Telegram ZIP/RAR extractor and ZIP creator for FadeHost",
+  "main":"index.js",
+  "scripts":{"start":"node index.js","check":"node --check index.js"},
+  "engines":{"node":">=20"},
+  "dependencies":{"adm-zip":"^0.5.16","node-unrar-js":"^2.0.2"}
+}
