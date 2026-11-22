@@ -1,527 +1,642 @@
 
 'use strict';
 
-const path = require('path');
+const fs = require('node:fs');
+const fsp = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+const { Readable } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
 const AdmZip = require('adm-zip');
 const unrar = require('node-unrar-js');
 
-const TOKEN =
-  process.env.TELEGRAM_BOT_TOKEN ||
+const TOKEN = process.env.TELEGRAM_BOT_TOKEN ||
   process.env.BOT_TOKEN ||
   process.env.TELEGRAM_TOKEN ||
   process.env.TOKEN;
 
 if (!TOKEN) {
-  console.error('Bot token topilmadi!');
+  console.error('Missing Telegram bot token');
   process.exit(1);
 }
 
 const API = `https://api.telegram.org/bot${TOKEN}`;
 const FILE_API = `https://api.telegram.org/file/bot${TOKEN}`;
-
-const MB = 1024 * 1024;
-
-// 256 MB RAM uchun ehtiyotkor limitlar
-const MAX_FILE = 10 * MB;
-const MAX_TOTAL = 20 * MB;
-const MAX_FILES = 15;
-const MAX_SESSIONS = 5;
-const SESSION_TIMEOUT = 10 * 60 * 1000;
+const ROOT = path.join(os.tmpdir(), 'telegram-archive-bot');
+const CLEAN_INTERVAL = 20 * 60 * 1000;
 
 const sessions = new Map();
+const queues = new Map();
+const modes = new Map();
 let offset = 0;
 
-function cleanName(name) {
-  return path
-    .basename(String(name || 'file').replace(/\\/g, '/'))
-    .replace(/[\x00-\x1f]/g, '_')
-    .slice(0, 100) || 'file';
+const KEYBOARD = {
+  keyboard: [
+    [
+      { text: '📦 Files to ZIP' },
+      { text: '📂 ZIP/RAR to Files' }
+    ],
+    [
+      { text: '✅ Create ZIP' },
+      { text: '🗑 Clear Files' }
+    ],
+    [
+      { text: '📊 Status' },
+      { text: 'ℹ️ Help' }
+    ]
+  ],
+  resize_keyboard: true,
+  is_persistent: true
+};
+
+function safeName(value) {
+  return path.basename(
+    String(value || 'file').replace(/\\/g, '/')
+  ).replace(/[\x00-\x1f]/g, '_').slice(0, 160) || 'file';
 }
 
-function safeEntry(name) {
-  const normalized = String(name).replace(/\\/g, '/');
-  const parts = normalized.split('/');
+function uniqueName(used, original) {
+  const base = safeName(original);
+  const ext = path.extname(base);
+  const stem = path.basename(base, ext);
 
-  return (
-    !normalized.startsWith('/') &&
-    !parts.includes('..') &&
-    !parts.includes('') &&
-    !/^[A-Za-z]:/.test(normalized)
-  );
-}
-
-function uniqueName(files, filename) {
-  const used = new Set(files.map(f => f.name));
-  const ext = path.extname(filename);
-  const base = path.basename(filename, ext);
-
-  let name = filename;
+  let name = base;
   let i = 2;
 
   while (used.has(name)) {
-    name = `${base}_${i++}${ext}`;
+    name = `${stem}_${i++}${ext}`;
   }
 
+  used.add(name);
   return name;
 }
 
-async function telegram(method, payload) {
+async function callTelegram(method, payload) {
   const response = await fetch(`${API}/${method}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(45000)
+    body: JSON.stringify(payload)
   });
 
-  const data = await response.json();
+  const result = await response.json();
 
-  if (!data.ok) {
+  if (!result.ok) {
     throw new Error(
-      data.description || `Telegram error ${response.status}`
+      result.description || `Telegram ${method} failed`
     );
   }
 
-  return data.result;
+  return result.result;
 }
 
-async function say(chatId, text) {
-  return telegram('sendMessage', {
+function say(chatId, text) {
+  return callTelegram('sendMessage', {
     chat_id: chatId,
-    text
+    text,
+    reply_markup: KEYBOARD
   });
 }
 
-async function sendFile(chatId, buffer, name) {
-  if (buffer.length > MAX_FILE) {
-    throw new Error('Yuboriladigan fayl 10 MB dan katta.');
-  }
-
-  const form = new FormData();
-
-  form.append('chat_id', String(chatId));
-  form.append(
-    'document',
-    new Blob([buffer]),
-    cleanName(name)
-  );
-
-  const response = await fetch(`${API}/sendDocument`, {
-    method: 'POST',
-    body: form,
-    signal: AbortSignal.timeout(60000)
-  });
-
-  const data = await response.json();
-
-  if (!data.ok) {
-    throw new Error(
-      data.description || 'Faylni yuborib bo‘lmadi.'
-    );
-  }
-
-  return data.result;
-}
-
-async function download(fileId, expectedSize) {
-  if (expectedSize > MAX_FILE) {
-    throw new Error('10 MB dan kichik fayl yuboring.');
-  }
-
-  const info = await telegram('getFile', {
+async function download(fileId, destination) {
+  const info = await callTelegram('getFile', {
     file_id: fileId
   });
 
   if (!info.file_path) {
-    throw new Error('Fayl manzili topilmadi.');
+    throw new Error(
+      'Telegram did not return a file path.'
+    );
   }
 
   const response = await fetch(
-    `${FILE_API}/${info.file_path}`,
-    { signal: AbortSignal.timeout(60000) }
+    `${FILE_API}/${info.file_path}`
   );
 
   if (!response.ok || !response.body) {
-    throw new Error('Fayl yuklanmadi.');
+    throw new Error('Download failed.');
   }
 
-  const chunks = [];
-  let total = 0;
-
-  for await (const chunk of response.body) {
-    total += chunk.length;
-
-    if (total > MAX_FILE) {
-      await response.body.cancel().catch(() => {});
-      throw new Error('Fayl 10 MB limitdan oshdi.');
-    }
-
-    chunks.push(chunk);
-  }
-
-  return Buffer.concat(chunks);
+  await pipeline(
+    Readable.fromWeb(response.body),
+    fs.createWriteStream(destination)
+  );
 }
 
-// ZIP arxivlarni ochish
-function unpackZip(buffer) {
-  const zip = new AdmZip(buffer);
+async function sendDocument(chatId, filePath, displayName) {
+  const content = await fsp.readFile(filePath);
+  const form = new FormData();
 
-  const entries = zip.getEntries().filter(
-    entry => !entry.isDirectory
+  form.append('chat_id', String(chatId));
+
+  form.append(
+    'document',
+    new Blob([content]),
+    safeName(displayName)
   );
 
-  if (!entries.length) {
-    throw new Error('ZIP arxiv bo‘sh.');
-  }
-
-  if (entries.length > MAX_FILES) {
-    throw new Error('Arxivda 15 tadan ko‘p fayl bor.');
-  }
-
-  const total = entries.reduce(
-    (sum, entry) => sum + Number(entry.header.size || 0),
-    0
-  );
-
-  if (total > MAX_TOTAL) {
-    throw new Error('Arxivdagi fayllar 20 MB dan katta.');
-  }
-
-  const files = [];
-
-  for (const entry of entries) {
-    if (!safeEntry(entry.entryName)) continue;
-
-    if (entry.header.size > MAX_FILE) {
-      throw new Error('Arxivdagi fayl 10 MB dan katta.');
-    }
-
-    const content = entry.getData();
-
-    if (content.length > MAX_FILE) {
-      throw new Error('Fayl 10 MB dan katta.');
-    }
-
-    const name = uniqueName(
-      files,
-      cleanName(entry.entryName)
-    );
-
-    files.push({ name, content });
-  }
-
-  return files;
-}
-
-// RAR arxivlarni ochish
-async function unpackRar(buffer) {
-  const data = Uint8Array.from(buffer);
-
-  const extractor = await unrar.createExtractorFromData({
-    data: data.buffer
+  const response = await fetch(`${API}/sendDocument`, {
+    method: 'POST',
+    body: form
   });
 
-  const headers = [
-    ...extractor.getFileList().fileHeaders
-  ].filter(h => !h.flags.directory);
+  const result = await response.json();
 
-  if (!headers.length) {
-    throw new Error('RAR arxiv bo‘sh.');
-  }
-
-  if (headers.length > MAX_FILES) {
-    throw new Error('RAR ichida 15 tadan ko‘p fayl bor.');
-  }
-
-  const total = headers.reduce(
-    (sum, h) => sum + Number(h.unpSize || 0),
-    0
-  );
-
-  if (total > MAX_TOTAL) {
-    throw new Error('RAR ichidagi fayllar 20 MB dan katta.');
-  }
-
-  const extracted = extractor.extract();
-  const files = [];
-
-  for (const item of extracted.files) {
-    if (item.fileHeader.flags.directory) continue;
-
-    if (!safeEntry(item.fileHeader.name)) continue;
-
-    if (!item.extraction) continue;
-
-    const content = Buffer.from(item.extraction);
-
-    if (content.length > MAX_FILE) {
-      throw new Error('RAR ichidagi fayl juda katta.');
-    }
-
-    const name = uniqueName(
-      files,
-      cleanName(item.fileHeader.name)
+  if (!result.ok) {
+    throw new Error(
+      result.description || 'Upload failed.'
     );
-
-    files.push({ name, content });
   }
-
-  return files;
 }
 
-// Xotirani avtomatik tozalash
-setInterval(() => {
-  const now = Date.now();
-
-  for (const [chatId, session] of sessions) {
-    if (now - session.lastActivity > SESSION_TIMEOUT) {
-      sessions.delete(chatId);
-      console.log(`Session cleaned: ${chatId}`);
-    }
+async function removeDir(dir) {
+  if (dir) {
+    await fsp.rm(dir, {
+      recursive: true,
+      force: true
+    });
   }
-}, 60 * 1000).unref();
+}
 
-async function handle(message) {
-  const chatId = message.chat?.id;
-  if (!chatId) return;
+async function clearFiles(chatId) {
+  const session = sessions.get(chatId);
+  sessions.delete(chatId);
 
-  const command = (message.text || '')
-    .split(' ')[0]
-    .split('@')[0]
-    .toLowerCase();
-
-  const existing = sessions.get(chatId);
-
-  if (existing) {
-    existing.lastActivity = Date.now();
+  if (session) {
+    await removeDir(session.dir);
   }
+}
 
-  if (command === '/start' || command === '/help') {
-    return say(
-      chatId,
-      '📦 Archive Bot\n\n' +
-      '📸 Rasmlar yuboring\n' +
-      '📄 Fayllar yuboring\n' +
-      '📁 ZIP yoki RAR yuboring\n\n' +
-      'Rasm va fayllarni ZIP qilish uchun:\n' +
-      '1. Fayllarni yuboring\n' +
-      '2. /done bosing\n' +
-      '3. Tayyor ZIPni oling\n\n' +
-      'ZIP/RAR yuborsangiz ichidagi fayllarni qaytaraman.\n\n' +
-      '/done — ZIP yaratish\n' +
-      '/cancel — tozalash\n' +
-      '/status — xotira holati\n\n' +
-      'Limit: 10 MB/fayl, 15 ta fayl, 20 MB jami.'
-    );
-  }
-
-  if (command === '/cancel') {
-    sessions.delete(chatId);
-
-    return say(chatId, '🗑 Fayllar tozalandi.');
-  }
-
-  if (command === '/status') {
-    const session = sessions.get(chatId);
-
-    const count = session?.files.length || 0;
-    const size = (session?.total || 0) / MB;
-
-    return say(
-      chatId,
-      `📊 Sessiya holati\n\n` +
-      `Fayllar: ${count}/${MAX_FILES}\n` +
-      `Hajm: ${size.toFixed(2)} MB / 20 MB\n\n` +
-      `10 daqiqa faolsizlikdan keyin fayllar tozalanadi.`
-    );
-  }
-
-  if (command === '/done') {
-    const session = sessions.get(chatId);
-
-    if (!session || !session.files.length) {
-      return say(chatId, 'Avval rasm yoki fayl yuboring.');
-    }
-
-    await say(chatId, '📦 ZIP tayyorlanyapti...');
-
-    const zip = new AdmZip();
-
-    for (const file of session.files) {
-      zip.addFile(file.name, file.content);
-    }
-
-    const result = zip.toBuffer();
-
-    if (result.length > MAX_FILE) {
-      throw new Error(
-        'Tayyor ZIP 10 MB dan katta. /cancel bosib, kamroq fayl yuboring.'
-      );
-    }
-
-    await sendFile(chatId, result, 'archive.zip');
-
-    sessions.delete(chatId);
-
-    return say(
-      chatId,
-      '✅ ZIP tayyor! Xotira tozalandi.'
-    );
-  }
-
-  const doc = message.document;
-
-  const photo = !doc && Array.isArray(message.photo)
-    ? message.photo[message.photo.length - 1]
-    : null;
-
-  if (!doc && !photo) return;
-
-  const filename = doc
-    ? cleanName(doc.file_name || 'document')
-    : `photo_${message.message_id}.jpg`;
-
-  const lower = filename.toLowerCase();
-  const isZip = lower.endsWith('.zip');
-  const isRar = lower.endsWith('.rar');
-
-  const source = doc || photo;
-
-  if (
-    !isZip &&
-    !isRar &&
-    !sessions.has(chatId) &&
-    sessions.size >= MAX_SESSIONS
-  ) {
-    throw new Error(
-      'Bot hozir band. Birozdan keyin urinib ko‘ring.'
-    );
-  }
-
-  if (!isZip && !isRar) {
-    const current = sessions.get(chatId);
-
-    if (current?.files.length >= MAX_FILES) {
-      throw new Error(
-        '15 ta fayl limiti. /done yoki /cancel bosing.'
-      );
-    }
-
-    if (
-      current &&
-      current.total + (source.file_size || 0) > MAX_TOTAL
-    ) {
-      throw new Error(
-        '20 MB limit. /done yoki /cancel bosing.'
-      );
-    }
-  }
-
-  const buffer = await download(
-    source.file_id,
-    source.file_size || 0
-  );
-
-  if (isZip || isRar) {
-    await say(chatId, '📂 Arxiv ochilyapti...');
-
-    const files = isZip
-      ? unpackZip(buffer)
-      : await unpackRar(buffer);
-
-    if (!files.length) {
-      return say(chatId, 'Arxivda mos fayllar topilmadi.');
-    }
-
-    let count = 0;
-
-    for (const file of files) {
-      await sendFile(chatId, file.content, file.name);
-      count++;
-    }
-
-    return say(
-      chatId,
-      `✅ ${count} ta fayl yuborildi.`
-    );
-  }
-
+async function getSession(chatId) {
   let session = sessions.get(chatId);
 
   if (!session) {
+    const dir = await fsp.mkdtemp(
+      path.join(ROOT, 'pending-')
+    );
+
     session = {
+      dir,
       files: [],
-      total: 0,
-      lastActivity: Date.now()
+      used: new Set(),
+      createdAt: Date.now()
     };
 
     sessions.set(chatId, session);
   }
 
-  if (session.files.length >= MAX_FILES) {
-    throw new Error('15 ta fayl limiti.');
+  return session;
+}
+
+async function addFile(chatId, fileId, filename) {
+  const session = await getSession(chatId);
+
+  const filenameSafe = uniqueName(
+    session.used,
+    filename
+  );
+
+  const filepath = path.join(
+    session.dir,
+    filenameSafe
+  );
+
+  try {
+    await download(fileId, filepath);
+
+    session.files.push({
+      name: filenameSafe,
+      filepath
+    });
+  } catch (error) {
+    session.used.delete(filenameSafe);
+
+    await fsp.rm(filepath, {
+      force: true
+    });
+
+    throw error;
   }
 
-  if (session.total + buffer.length > MAX_TOTAL) {
-    throw new Error('20 MB limitdan oshdi.');
-  }
-
-  const name = uniqueName(session.files, filename);
-
-  session.files.push({
-    name,
-    content: buffer
-  });
-
-  session.total += buffer.length;
-  session.lastActivity = Date.now();
-
-  return say(
+  await say(
     chatId,
-    `✅ ${name} qabul qilindi.\n` +
-    `Jami: ${session.files.length} ta fayl.\n\n` +
-    `ZIP olish uchun /done bosing.`
+    `✅ Added: ${filenameSafe}\n` +
+    `Files ready: ${session.files.length}\n` +
+    `Tap ✅ Create ZIP when finished.`
   );
 }
 
-async function main() {
-  console.log('Archive Bot starting...');
+async function createZip(chatId) {
+  const session = sessions.get(chatId);
 
-  await telegram('deleteWebhook', {
+  if (!session?.files.length) {
+    return say(
+      chatId,
+      'No files yet. Send photos or documents first.'
+    );
+  }
+
+  await say(
+    chatId,
+    '⏳ Creating your ZIP archive...'
+  );
+
+  const zip = new AdmZip();
+
+  for (const file of session.files) {
+    zip.addLocalFile(
+      file.filepath,
+      '',
+      file.name
+    );
+  }
+
+  const output = path.join(
+    session.dir,
+    'archive.zip'
+  );
+
+  await new Promise((resolve, reject) => {
+    zip.writeZip(output, error => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+
+  await sendDocument(
+    chatId,
+    output,
+    'archive.zip'
+  );
+
+  await clearFiles(chatId);
+
+  await say(
+    chatId,
+    '✅ ZIP created and sent. Temporary files removed.'
+  );
+}
+
+async function unpackZip(filepath, targetDir) {
+  const zip = new AdmZip(filepath);
+  const names = new Set();
+  const files = [];
+
+  for (const entry of zip.getEntries()) {
+    if (entry.isDirectory) continue;
+
+    const name = uniqueName(
+      names,
+      entry.entryName
+    );
+
+    const output = path.join(
+      targetDir,
+      name
+    );
+
+    await fsp.writeFile(
+      output,
+      entry.getData()
+    );
+
+    files.push({
+      name,
+      filepath: output
+    });
+  }
+
+  return files;
+}
+
+async function unpackRar(filepath, targetDir) {
+  const bytes = await fsp.readFile(filepath);
+
+  const extractor = await unrar.createExtractorFromData({
+    data: Uint8Array.from(bytes).buffer
+  });
+
+  const names = new Set();
+  const files = [];
+
+  for (const item of extractor.extract().files) {
+    if (
+      item.fileHeader.flags.directory ||
+      !item.extraction
+    ) continue;
+
+    const name = uniqueName(
+      names,
+      item.fileHeader.name
+    );
+
+    const output = path.join(
+      targetDir,
+      name
+    );
+
+    await fsp.writeFile(
+      output,
+      Buffer.from(item.extraction)
+    );
+
+    files.push({
+      name,
+      filepath: output
+    });
+  }
+
+  return files;
+}
+
+async function extractArchive(
+  chatId,
+  fileId,
+  filename
+) {
+  const workDir = await fsp.mkdtemp(
+    path.join(ROOT, 'extract-')
+  );
+
+  try {
+    await say(
+      chatId,
+      '⏳ Extracting archive...'
+    );
+
+    const source = path.join(
+      workDir,
+      `input${path.extname(filename).toLowerCase()}`
+    );
+
+    await download(fileId, source);
+
+    const files = filename.toLowerCase().endsWith('.rar')
+      ? await unpackRar(source, workDir)
+      : await unpackZip(source, workDir);
+
+    if (!files.length) {
+      return say(
+        chatId,
+        'No files found in this archive.'
+      );
+    }
+
+    for (const file of files) {
+      await sendDocument(
+        chatId,
+        file.filepath,
+        file.name
+      );
+    }
+
+    await say(
+      chatId,
+      `✅ Extracted and sent ${files.length} file(s).`
+    );
+  } finally {
+    await removeDir(workDir);
+  }
+}
+
+async function status(chatId) {
+  const session = sessions.get(chatId);
+
+  if (!session) {
+    return say(
+      chatId,
+      '📊 No temporary files stored.'
+    );
+  }
+
+  let total = 0;
+
+  for (const file of session.files) {
+    try {
+      total += (
+        await fsp.stat(file.filepath)
+      ).size;
+    } catch (_) {}
+  }
+
+  return say(
+    chatId,
+    `📊 Files: ${session.files.length}\n` +
+    `Stored size: ${(total / 1048576).toFixed(2)} MB\n` +
+    `Temporary files are cleared every 20 minutes.`
+  );
+}
+
+async function handle(message) {
+  const chatId = message.chat?.id;
+  if (!chatId) return;
+
+  const input = (
+    message.text || ''
+  ).trim();
+
+  const command = input
+    .split(' ')[0]
+    .split('@')[0]
+    .toLowerCase();
+
+  if (
+    command === '/start' ||
+    command === '/help' ||
+    input === 'ℹ️ Help'
+  ) {
+    return say(
+      chatId,
+      '📦 Archive Bot\n\n' +
+      '📦 Files to ZIP: Send photos or documents, then tap ✅ Create ZIP.\n' +
+      '📂 ZIP/RAR to Files: Send a ZIP or RAR archive to extract it.\n' +
+      '🗑 Clear Files: Delete your queued files.\n' +
+      '📊 Status: Check your queued files.\n\n' +
+      'Temporary files are cleared automatically every 20 minutes.\n' +
+      'Telegram and hosting size limits still apply.'
+    );
+  }
+
+  if (input === '📦 Files to ZIP') {
+    modes.set(chatId, 'zip');
+
+    return say(
+      chatId,
+      '📦 ZIP mode enabled. Send photos or files. Tap ✅ Create ZIP when ready.'
+    );
+  }
+
+  if (input === '📂 ZIP/RAR to Files') {
+    modes.set(chatId, 'extract');
+
+    return say(
+      chatId,
+      '📂 Extraction mode enabled. Send a ZIP or RAR archive.'
+    );
+  }
+
+  if (
+    command === '/cancel' ||
+    input === '🗑 Clear Files'
+  ) {
+    await clearFiles(chatId);
+
+    return say(
+      chatId,
+      '🗑 Temporary files cleared.'
+    );
+  }
+
+  if (
+    command === '/status' ||
+    input === '📊 Status'
+  ) {
+    return status(chatId);
+  }
+
+  if (
+    command === '/done' ||
+    input === '✅ Create ZIP'
+  ) {
+    return createZip(chatId);
+  }
+
+  const document = message.document;
+
+  const photo = !document && message.photo?.length
+    ? message.photo[message.photo.length - 1]
+    : null;
+
+  if (!document && !photo) return;
+
+  const file = document || photo;
+
+  const filename = document
+    ? safeName(
+        document.file_name ||
+        `document_${message.message_id}`
+      )
+    : `photo_${message.message_id}.jpg`;
+
+  const archive = /\.(zip|rar)$/i.test(filename);
+  const mode = modes.get(chatId);
+
+  if (mode === 'extract' && !archive) {
+    return say(
+      chatId,
+      'Please send a ZIP or RAR archive, or choose 📦 Files to ZIP.'
+    );
+  }
+
+  if (archive && mode !== 'zip') {
+    return extractArchive(
+      chatId,
+      file.file_id,
+      filename
+    );
+  }
+
+  return addFile(
+    chatId,
+    file.file_id,
+    filename
+  );
+}
+
+function enqueue(chatId, task) {
+  const previous =
+    queues.get(chatId) || Promise.resolve();
+
+  const current = previous
+    .catch(() => {})
+    .then(task);
+
+  queues.set(chatId, current);
+
+  current.finally(() => {
+    if (queues.get(chatId) === current) {
+      queues.delete(chatId);
+    }
+  }).catch(() => {});
+}
+
+// Automatically clean temporary files every 20 minutes
+setInterval(async () => {
+  for (const chatId of sessions.keys()) {
+    if (queues.has(chatId)) continue;
+
+    try {
+      await clearFiles(chatId);
+    } catch (error) {
+      console.error(
+        'Cleanup error:',
+        error.message
+      );
+    }
+  }
+}, CLEAN_INTERVAL).unref();
+
+async function main() {
+  await fsp.mkdir(ROOT, {
+    recursive: true
+  });
+
+  // Clean leftover files after restart
+  for (const name of await fsp.readdir(ROOT)) {
+    await removeDir(
+      path.join(ROOT, name)
+    );
+  }
+
+  await callTelegram('deleteWebhook', {
     drop_pending_updates: false
   });
 
-  console.log('Archive Bot running!');
+  console.log('Archive Bot is running.');
 
   while (true) {
     try {
-      const updates = await telegram('getUpdates', {
-        offset,
-        timeout: 25,
-        allowed_updates: ['message']
-      });
+      const updates = await callTelegram(
+        'getUpdates',
+        {
+          offset,
+          timeout: 25,
+          allowed_updates: ['message']
+        }
+      );
 
       for (const update of updates) {
         offset = update.update_id + 1;
 
-        try {
-          await handle(update.message || {});
-        } catch (error) {
-          console.error('Error:', error);
+        const message = update.message;
 
-          const chatId = update.message?.chat?.id;
+        if (!message?.chat?.id) continue;
 
-          if (chatId) {
-            await say(
-              chatId,
-              `❌ ${error.message || 'Xatolik yuz berdi.'}`
-            ).catch(() => {});
+        enqueue(
+          message.chat.id,
+          async () => {
+            try {
+              await handle(message);
+            } catch (error) {
+              console.error(
+                'Message error:',
+                error
+              );
+
+              await say(
+                message.chat.id,
+                `❌ ${error.message || 'Something went wrong.'}`
+              ).catch(() => {});
+            }
           }
-        }
+        );
       }
     } catch (error) {
-      console.error('Polling error:', error.message);
+      console.error(
+        'Polling error:',
+        error.message
+      );
 
       await new Promise(resolve =>
         setTimeout(resolve, 3000)
@@ -534,3 +649,4 @@ main().catch(error => {
   console.error(error);
   process.exit(1);
 });
+
